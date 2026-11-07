@@ -10,7 +10,6 @@
 #include <mygui/MyGUI_IUnlinkWidget.h>
 #include <mygui/MyGUI_WidgetManager.h>
 #include <map>
-#include <set>
 #include <sstream>
 #include <vector>
 #include <algorithm>
@@ -58,58 +57,11 @@ Settings Sanitize(Settings s,size_t backgroundCount){
 }
 std::map<std::string,Settings> settings;
 std::map<std::string,Ogre::TexturePtr> composed;
-std::set<std::string> validComposed;
-std::map<std::string,DWORD> composedUsed;
-struct CompositionRetry {unsigned int attempts;DWORD last;CompositionRetry():attempts(0),last(0){}};
-std::map<std::string,CompositionRetry> compositionRetries;
-// Track only textures created here; native atlas resources are never removed.
-std::set<std::string> ownedTextures;
-std::map<MyGUI::Widget*,std::string> portraitBindings;
-std::map<std::string,unsigned int> retiredTextures;
-void EnsureWidgetLifetime();
-void TrackPortraitBinding(MyGUI::Widget* widget,const std::string& name){
- if(ownedTextures.count(name)){EnsureWidgetLifetime();portraitBindings[widget]=name;}
- else portraitBindings.erase(widget);
-}
-void RetireComposed(const std::string& key){
- std::map<std::string,Ogre::TexturePtr>::iterator i=composed.find(key);if(i==composed.end())return;
- if(!i->second.isNull()){std::string name=i->second->getName();if(ownedTextures.count(name))retiredTextures[name]=0;}
- composed.erase(i);validComposed.erase(key);composedUsed.erase(key);compositionRetries.erase(key);
-}
-void CollectRetiredTextures(){
- Ogre::TextureManager* manager=Ogre::TextureManager::getSingletonPtr();if(!manager)return;
- unsigned int budget=8;
- for(std::map<std::string,unsigned int>::iterator i=retiredTextures.begin();i!=retiredTextures.end() && budget;){
-  bool bound=false;
-  for(std::map<MyGUI::Widget*,std::string>::const_iterator b=portraitBindings.begin();b!=portraitBindings.end();++b)if(b->second==i->first){bound=true;break;}
-  if(bound){i->second=0;++i;continue;}
-  // Wait for two complete HUD updates after the final widget unbinds.
-  if(i->second++<2){++i;continue;}
-  std::string name=i->first;
-  if(ownedTextures.count(name)){manager->remove(name);ownedTextures.erase(name);}
-  retiredTextures.erase(i++);--budget;
- }
-}
-// Only evict unbound generated portraits; active HUD images remain protected.
-bool MakeCompositionRoom(const std::string& key){
- if(composed.count(key) || composed.size()<256)return true;
- std::string victim;DWORD oldest=0,now=GetTickCount();
- for(std::map<std::string,Ogre::TexturePtr>::const_iterator i=composed.begin();i!=composed.end();++i){
-  if(i->second.isNull()){victim=i->first;break;}
-  bool bound=false;std::string name=i->second->getName();
-  for(std::map<MyGUI::Widget*,std::string>::const_iterator b=portraitBindings.begin();b!=portraitBindings.end();++b)if(b->second==name){bound=true;break;}
-  if(bound)continue;
-  DWORD age=now-composedUsed[i->first];if(victim.empty() || age>oldest){oldest=age;victim=i->first;}
- }
- if(victim.empty())return false;
- RetireComposed(victim);return true;
-}
 std::map<std::string,DWORD> requested;
 unsigned int textureSerial=0;
 std::map<std::string,hand> pendingComposition;
 std::map<std::string,hand> pendingSquadRefresh;
-bool ComposeRegistered(Character* c);
-void QueueComposition(Character* c,bool reset);
+void ComposeRegistered(Character* c);
 std::string Key(Character* c);
 std::map<std::string,Ogre::TRect<float> > nativeUV;
 std::map<std::string,std::string> nativeTextures;
@@ -118,7 +70,6 @@ __declspec(thread) Capture* capturing=0;
 void (*originalTexture)(MyGUI::ImageBox*,const std::string&)=0;
 void Texture(MyGUI::ImageBox* image,const std::string& name){
  if(!image)return;originalTexture(image,name);
- if(pluginReady && !failed){try{TrackPortraitBinding(image,name);}catch(const std::exception& e){ErrorLog(std::string("Portrait Editor texture binding: ")+e.what());}}
  if(!pluginReady || failed || !capturing || capturing->widget!=image)return;
  try{Character* c=capturing->character.getCharacter();if(c && name.find("PortraitEditorComposed_")!=0)nativeTextures[Key(c)]=name;}
  catch(const std::exception& e){ErrorLog(std::string("Portrait Editor texture capture: ")+e.what());}
@@ -169,7 +120,6 @@ std::map<MyGUI::Widget*,ButtonAction> buttonActions;
 std::map<MyGUI::ScrollBar*,MyGUI::EditBox*> numberFields;
 struct WidgetLifetime : MyGUI::IUnlinkWidget {
  void _unlinkWidget(MyGUI::Widget* widget){
-  portraitBindings.erase(widget);
   buttonActions.erase(widget);
   for(std::map<MyGUI::ScrollBar*,MyGUI::EditBox*>::iterator i=numberFields.begin();i!=numberFields.end();){
    if(i->first==widget || i->second==widget){numberFields.erase(i++);opened=false;}else ++i;
@@ -204,11 +154,6 @@ struct WidgetLifetime : MyGUI::IUnlinkWidget {
  }
 } widgetLifetime;
 bool lifetimeRegistered=false;
-void EnsureWidgetLifetime(){
- if(!lifetimeRegistered && MyGUI::WidgetManager::getInstancePtr()){
-  MyGUI::WidgetManager::getInstance().registerUnlinker(&widgetLifetime);lifetimeRegistered=true;
- }
-}
 void Resources(){if(!resourcesReady){Ogre::ResourceGroupManager::getSingleton().addResourceLocation(resources,"FileSystem","General");Ogre::ResourceGroupManager::getSingleton().addResourceLocation(backgroundFolder,"FileSystem","General");resourcesReady=true;}}
 bool EditorControlsReady(){return numberFields.size()==10 && window && preview && backdrop && title && bgLabel && status && rotation && tilt && height && horizontal && zoom && red && green && blue && brightness && opacity && redLabel && greenLabel && blueLabel && brightnessLabel && opacityLabel && resetButton && cancelButton && applyButton;}
 void Create();
@@ -223,7 +168,7 @@ void EnsureUI(){
  if(window)gui->destroyWidget(window);if(popup)gui->destroyWidget(popup);
  Create();
 }
-DWORD changedAt=0,lastPortraitRefresh=0;
+DWORD changedAt=0;
 const char* bgNames[]={"Default","Teal","Black","Sand","Custom colour","Bordeaux"};
 const char* bgFiles[]={"","portrait_teal.png","portrait_black.png","portrait_sand.png","portrait_custom.png","portrait_bordeaux.png"};
 std::string Key(Character* c) {
@@ -244,12 +189,6 @@ Settings Get(Character* c) {
  s=Sanitize(s,BackgroundCount());settings[k]=s;return s;
 }
 Settings Effective(Character* c){return opened && editing.getCharacter()==c?draft:Get(c);}
-void QueueComposition(Character* c,bool reset){
- if(!c)return;std::string key=Key(c);if(key.empty())return;
- if(reset)compositionRetries.erase(key);
- if(Effective(c).background==0){RetireComposed(key);pendingComposition.erase(key);compositionRetries.erase(key);return;}
- if(compositionRetries[key].attempts<3)pendingComposition[key]=c->getHandle();
-}
 bool Store(Character* c,const Settings& value){
  std::string k=Key(c);if(k.empty() || config.empty())return false;
  Settings s=Sanitize(value,BackgroundCount());settings[k]=s;
@@ -292,7 +231,7 @@ void RestoreIdentity(Character* c,const IdentityTransfer& snapshot){
  hand current=c->getHandle();if(current.isNull() || current.getCharacter()!=c)return;
  std::string k=Key(c);if(k.empty() || k==snapshot.key)return;
  bool written=Store(c,snapshot.saved);
- nativeUV.erase(k);nativeTextures.erase(k);RetireComposed(k);RetireComposed(snapshot.key);requested.erase(k);
+ nativeUV.erase(k);nativeTextures.erase(k);composed.erase(k);requested.erase(k);
  pendingComposition.erase(snapshot.key);pendingSquadRefresh.erase(snapshot.key);
  if(snapshot.wasEditing)editing=current;if(snapshot.wasPending)pending=current;
  // Render only later, from the existing bounded HUD refresh queue. No GUI or
@@ -482,7 +421,7 @@ void BgPrevious(MyGUI::Widget*){draft.background=int((draft.background+Backgroun
 void Reset(MyGUI::Widget*){draft=Settings();Sync();Changed();}
 void Front(MyGUI::Widget*){draft.yaw=0;draft.pitch=0;Sync();Changed();}
 void ThreeQuarter(MyGUI::Widget*){draft.yaw=35;draft.pitch=0;Sync();Changed();}
-void QueuePortrait(){QueueComposition(editing.getCharacter(),true);PortraitManager* pm=PortraitManager::getInstance();if(pm && editing.getCharacter()){PortraitData* pd=pm->getPortrait(editing);if(pd){pd->reloadPortrait=true;pd->forceUpdate();}}if(ou && editing.getCharacter())ou->addPortraitUpdate(editing);}
+void QueuePortrait(){PortraitManager* pm=PortraitManager::getInstance();if(pm && editing.getCharacter()){PortraitData* pd=pm->getPortrait(editing);if(pd){pd->reloadPortrait=true;pd->forceUpdate();}}if(ou && editing.getCharacter())ou->addPortraitUpdate(editing);}
 void Cancel(MyGUI::Widget*){opened=false;if(window)window->setVisible(false);QueuePortrait();}
 void Apply(MyGUI::Widget*){CommitFocusedNumber();Character* c=editing.getCharacter();if(!c)return;if(!Store(c,draft)){if(status)status->setCaption("Could not save settings. Check RE_Kenshi_log.txt.");return;}opened=false;if(window)window->setVisible(false);QueuePortrait();}
 MyGUI::Button* Button(MyGUI::Widget* p,int x,int y,int w,const char* label,void (*callback)(MyGUI::Widget*)){MyGUI::Button* b=p->createWidget<MyGUI::Button>("Kenshi_Button1",MyGUI::IntCoord(x,y,w,28),MyGUI::Align::Default);b->setCaption(label);buttonActions[b]=callback;b->eventMouseButtonClick+=MyGUI::newDelegate(&DispatchButton);return b;}
@@ -511,7 +450,7 @@ void OpenEditor(MyGUI::Widget*){
 
 void Create(){
  MyGUI::Gui* g=MyGUI::Gui::getInstancePtr();if(!g || !MyGUI::RenderManager::getInstancePtr())return;
- EnsureWidgetLifetime();
+ if(!lifetimeRegistered){MyGUI::WidgetManager::getInstance().registerUnlinker(&widgetLifetime);lifetimeRegistered=true;}
  Resources();
  MyGUI::IntSize view=MyGUI::RenderManager::getInstance().getViewSize();
  window=g->createWidget<MyGUI::Widget>("Kenshi_GenericTextBoxSkin",MyGUI::IntCoord(std::max(0,(view.width-430)/2),std::max(0,(view.height-700)/2),430,700),MyGUI::Align::Default,"Window","PortraitEditorWindow");
@@ -614,14 +553,9 @@ void (*originalCell)(PortraitMainCellView*,const MyGUI::IBDrawItemInfo&,Portrait
 void SetComposed(Character* c,MyGUI::ImageBox* image){
  if(!c || !image || Effective(c).background==0)return;
  std::string key=Key(c);std::map<std::string,Ogre::TexturePtr>::iterator i=composed.find(key);
- if(i!=composed.end() && !i->second.isNull() && validComposed.count(key)){
-  composedUsed[key]=GetTickCount();
-  image->setImageInfo(i->second->getName(),MyGUI::IntCoord(0,0,i->second->getWidth(),i->second->getHeight()),MyGUI::IntSize(i->second->getWidth(),i->second->getHeight()));image->setImageIndex(0);TrackPortraitBinding(image,i->second->getName());
- }else {
-  // A failed composition must not continue displaying an old draft background.
-  if(portraitBindings.count(image)){PortraitManager* pm=PortraitManager::getInstance();if(pm)pm->setImageWidget(c->getHandle(),image,true);}
-  QueueComposition(c,false);
- }
+ if(i!=composed.end() && !i->second.isNull()){
+  image->setImageInfo(i->second->getName(),MyGUI::IntCoord(0,0,i->second->getWidth(),i->second->getHeight()),MyGUI::IntSize(i->second->getWidth(),i->second->getHeight()));image->setImageIndex(0);
+ }else if(ou && !key.empty() && GetTickCount()-requested[key]>1000){requested[key]=GetTickCount();ou->addPortraitUpdate(c->getHandle());}
 }
 void Cell(PortraitMainCellView* cell,const MyGUI::IBDrawItemInfo& info,PortraitData* data){
  if(!cell)return;
@@ -634,41 +568,23 @@ void Update(MainBarGUI* bar){
  identityThread=GetCurrentThreadId();
  try{
   RefreshTransferredPortraits();
-  CollectRetiredTextures();
   PollPortraitMenu();
   // Drain a snapshot. Rendering may queue more composition work during callbacks.
   std::map<std::string,hand> queued;queued.swap(pendingComposition);
   size_t compositionBudget=8;
   for(std::map<std::string,hand>::iterator i=queued.begin();i!=queued.end();++i){
    if(!compositionBudget){if(!pendingComposition.count(i->first))pendingComposition[i->first]=i->second;continue;}
-   --compositionBudget;Character* c=i->second.getCharacter();if(!c){compositionRetries.erase(i->first);continue;}
-   std::string key=Key(c);if(key!=i->first)continue;
-   if(Effective(c).background==0){RetireComposed(key);compositionRetries.erase(key);continue;}
-   CompositionRetry retry=compositionRetries[key];if(retry.attempts>=3)continue;
-   if(retry.attempts && GetTickCount()-retry.last<75){pendingComposition[key]=i->second;continue;}
-   ++retry.attempts;retry.last=GetTickCount();compositionRetries[key]=retry;
-   // Keep the last successful image while the replacement is pending.
-   if(ComposeRegistered(c)){compositionRetries.erase(key);}
-   else {
-    compositionRetries[key]=retry;
-    // Reacquire after native image assignment; never retain a borrowed actor.
-    c=i->second.getCharacter();
-    if(c && Key(c)==key && retry.attempts<3)pendingComposition[key]=i->second;
-    if(retry.attempts==3){validComposed.erase(key);ErrorLog("Portrait Editor: background update stopped after three attempts; keeping native portrait");}
-   }
+   --compositionBudget;Character* c=i->second.getCharacter();if(c)ComposeRegistered(c);
   }
   if(!opened || !EditorControlsReady())return;
   Character* c=editing.getCharacter();if(!c){Cancel(0);return;}
-  if(dirty && (GetTickCount()-changedAt>=75 || GetTickCount()-lastPortraitRefresh>=100)){dirty=false;lastPortraitRefresh=GetTickCount();QueuePortrait();}
+  if(dirty && GetTickCount()-changedAt>180){dirty=false;QueuePortrait();}
   PortraitManager* pm=PortraitManager::getInstance();if(pm)pm->setImageWidget(editing,preview,true);
   c=editing.getCharacter();if(opened && c && preview)SetComposed(c,preview);
- }catch(const std::exception& e){
-  failed=true;dirty=false;
-  UIError("Portrait Editor disabled after update error; restart required: ",e);
- }
+ }catch(const std::exception& e){failed=true;ErrorLog(std::string("Portrait Editor update: ")+e.what());}
 }
 
-struct RenderContext {RenderToTextureotron* machine;Character* character;Settings settings;Ogre::Camera* camera;Ogre::Vector3 position,focus;Ogre::Quaternion orientation;Ogre::Radian fov;bool adjusted,hasFocus;RenderContext():machine(0),character(0),camera(0),adjusted(false),hasFocus(false){} };
+struct RenderContext {Character* character;Settings settings;Ogre::Camera* camera;Ogre::Vector3 position,focus;Ogre::Quaternion orientation;Ogre::Radian fov;bool adjusted,hasFocus;RenderContext():character(0),camera(0),adjusted(false),hasFocus(false){} };
 __declspec(thread) RenderContext* active=0;
 __declspec(thread) bool modifying=false;
 struct ModifyScope {bool previous;ModifyScope():previous(modifying){modifying=true;}~ModifyScope(){modifying=previous;}};
@@ -679,17 +595,16 @@ const Ogre::Matrix4& (*originalViewOwn)(const Ogre::Camera*,bool)=0;
 void Look(Ogre::Camera* camera,const Ogre::Vector3& target){
  if(!camera)return;
  originalLook(camera,target);
- if(active && active->machine && active->machine->camera==camera && !modifying && !active->adjusted){active->camera=camera;active->focus=target;active->hasFocus=true;}
+ if(active && !modifying && !active->adjusted){active->camera=camera;active->focus=target;active->hasFocus=true;}
 }
 void LookXYZ(Ogre::Camera* camera,float x,float y,float z){
  if(!camera)return;
  originalLookXYZ(camera,x,y,z);
- if(active && active->machine && active->machine->camera==camera && !modifying && !active->adjusted){active->camera=camera;active->focus=Ogre::Vector3(x,y,z);active->hasFocus=true;}
+ if(active && !modifying && !active->adjusted){active->camera=camera;active->focus=Ogre::Vector3(x,y,z);active->hasFocus=true;}
 }
 void Adjust(const Ogre::Camera* source){
  RenderContext* ctx=active;if(!pluginReady || failed || !ctx || modifying || ctx->adjusted || !source)return;
  Ogre::Camera* camera=const_cast<Ogre::Camera*>(source);
- if(!ctx->machine || ctx->machine->camera!=camera)return;
  if(ctx->camera && ctx->camera!=camera)return;
  ctx->camera=camera;ctx->position=camera->getPosition();ctx->orientation=camera->getOrientation();ctx->fov=camera->getFOVy();ctx->adjusted=true;
  Ogre::Vector3 focus=ctx->hasFocus?ctx->focus:ctx->position+camera->getDirection()*10.f;
@@ -707,16 +622,16 @@ void Adjust(const Ogre::Camera* source){
 const Ogre::Matrix4& View(const Ogre::Camera* camera){Adjust(camera);return originalView(camera);}
 const Ogre::Matrix4& ViewOwn(const Ogre::Camera* camera,bool own){Adjust(camera);return originalViewOwn(camera,own);}
 void Restore(RenderContext& ctx){if(ctx.adjusted && ctx.camera){ModifyScope scope;ctx.camera->setPosition(ctx.position);ctx.camera->setOrientation(ctx.orientation);ctx.camera->setFOVy(ctx.fov);}}
-bool Compose(Character* c,Ogre::SharedPtr<Ogre::Texture> atlas,const iVector2& tileSize,const Ogre::TRect<float>& rect){
- Settings s=Sanitize(Effective(c),BackgroundCount());if(s.background==0 || atlas.isNull())return false;std::string key=Key(c);if(key.empty())return false;
+void Compose(Character* c,Ogre::SharedPtr<Ogre::Texture> atlas,const iVector2& tileSize,const Ogre::TRect<float>& rect){
+ Settings s=Sanitize(Effective(c),BackgroundCount());if(s.background==0 || atlas.isNull())return;std::string key=Key(c);if(key.empty())return;
  try{
   size_t w=atlas->getWidth(),h=atlas->getHeight();
-  if(!w || !h || w>4096 || h>4096 || !_finite(rect.left) || !_finite(rect.top) || !_finite(rect.right) || !_finite(rect.bottom))return false;
-  if(!MakeCompositionRoom(key))return false;
-  if(rect.left<0 || rect.top<0 || rect.right>1 || rect.bottom>1 || rect.right<=rect.left || rect.bottom<=rect.top)return false;
+  if(!w || !h || w>4096 || h>4096 || !_finite(rect.left) || !_finite(rect.top) || !_finite(rect.right) || !_finite(rect.bottom))return;
+  if(composed.size()>=256 && !composed.count(key))return;
+  if(rect.left<0 || rect.top<0 || rect.right>1 || rect.bottom>1 || rect.right<=rect.left || rect.bottom<=rect.top)return;
   size_t left=size_t(std::max(0.f,rect.left)*w+.5f),top=size_t(std::max(0.f,rect.top)*h+.5f);
   size_t right=size_t(std::min(1.f,rect.right)*w+.5f),bottom=size_t(std::min(1.f,rect.bottom)*h+.5f);
-  if(right<=left || bottom<=top || right>w || bottom>h || right-left>512 || bottom-top>512){ErrorLog("Portrait Editor: invalid atlas tile rectangle");return false;}
+  if(right<=left || bottom<=top || right>w || bottom>h || right-left>512 || bottom-top>512){ErrorLog("Portrait Editor: invalid atlas tile rectangle");return;}
   size_t tw=right-left,th=bottom-top;std::vector<unsigned char> pixels(tw*th*4);
   Ogre::PixelBox box(tw,th,1,Ogre::PF_BYTE_RGBA,&pixels[0]);
   std::vector<unsigned char> sheet(w*h*4);
@@ -728,17 +643,17 @@ bool Compose(Character* c,Ogre::SharedPtr<Ogre::Texture> atlas,const iVector2& t
   float b=s.background==1?88.f/255:s.background==2?0:s.background==3?84.f/255:s.background==5?52.f/255:s.b;
   const std::vector<unsigned char>* scenery=0;
   if(s.background>=6){
-   if(size_t(s.background-6)>=customBackgrounds.size())return false;
+   if(size_t(s.background-6)>=customBackgrounds.size())return;
    Resources();size_t cacheBytes=0;for(std::map<std::string,std::vector<unsigned char> >::const_iterator i=backgroundPixels.begin();i!=backgroundPixels.end();++i)cacheBytes+=i->second.size();
    if(cacheBytes+tw*th*3>64u*1024u*1024u)backgroundPixels.clear();
    std::string filename=customBackgrounds[s.background-6];std::ostringstream cacheName;cacheName<<filename<<':'<<tw<<'x'<<th;std::vector<unsigned char>& cached=backgroundPixels[cacheName.str()];
    if(cached.empty()){
-    Ogre::Image image;image.load(filename,"General");size_t iw=image.getWidth(),ih=image.getHeight();if(!iw || !ih || iw>2048 || ih>2048){ErrorLog("Portrait Editor: background must be 2048x2048 or smaller");return false;}
+    Ogre::Image image;image.load(filename,"General");size_t iw=image.getWidth(),ih=image.getHeight();if(!iw || !ih || iw>2048 || ih>2048){ErrorLog("Portrait Editor: background must be 2048x2048 or smaller");return;}
     size_t side=std::min(iw,ih),ox=(iw-side)/2,oy=(ih-side)/2;std::vector<unsigned char> generated(tw*th*3);
     for(size_t y=0;y<th;++y)for(size_t x=0;x<tw;++x){Ogre::ColourValue colour=image.getColourAt(ox+x*side/tw,oy+y*side/th,0);size_t n=(y*tw+x)*3;generated[n]=static_cast<unsigned char>(Bounded(colour.r,0,1,0)*255);generated[n+1]=static_cast<unsigned char>(Bounded(colour.g,0,1,0)*255);generated[n+2]=static_cast<unsigned char>(Bounded(colour.b,0,1,0)*255);}
     cached.swap(generated);
    }
-   if(cached.size()!=tw*th*3)return false;
+   if(cached.size()!=tw*th*3)return;
    scenery=&cached;
   }
   for(size_t n=0;n<pixels.size();n+=4){
@@ -749,45 +664,41 @@ bool Compose(Character* c,Ogre::SharedPtr<Ogre::Texture> atlas,const iVector2& t
    pixels[n+3]=static_cast<unsigned char>(outputAlpha*255+.5f);
   }
   Ogre::TexturePtr& texture=composed[key];
-  if(texture.isNull()){std::ostringstream name;name<<"PortraitEditorComposed_"<<++textureSerial;ownedTextures.insert(name.str());
-   try{texture=Ogre::TextureManager::getSingleton().createManual(name.str(),"General",Ogre::TEX_TYPE_2D,tw,th,0,Ogre::PF_BYTE_RGBA,Ogre::TU_DYNAMIC_WRITE_ONLY_DISCARDABLE);}
-   catch(...){retiredTextures[name.str()]=0;throw;}}
-  if(texture->getWidth()!=tw || texture->getHeight()!=th){RetireComposed(key);return false;}
+  if(texture.isNull()){std::ostringstream name;name<<"PortraitEditorComposed_"<<++textureSerial;texture=Ogre::TextureManager::getSingleton().createManual(name.str(),"General",Ogre::TEX_TYPE_2D,tw,th,0,Ogre::PF_BYTE_RGBA,Ogre::TU_DYNAMIC_WRITE_ONLY_DISCARDABLE);}
+  if(texture->getWidth()!=tw || texture->getHeight()!=th)return;
   texture->getBuffer()->blitFromMemory(box);
   static bool reported=false;if(!reported){reported=true;std::ostringstream message;message<<"Portrait Editor: background composed successfully, tile "<<tw<<"x"<<th;DebugLog(message.str());}
-  validComposed.insert(key);composedUsed[key]=GetTickCount();return true;
- }catch(const std::exception& e){ErrorLog(std::string("Portrait Editor background composition: ")+e.what());return false;}
+ }catch(const std::exception& e){ErrorLog(std::string("Portrait Editor background composition: ")+e.what());}
 }
-bool ComposeRegistered(Character* c){
- if(!c)return false;
+void ComposeRegistered(Character* c){
+ if(!c)return;
  hand saved=c->getHandle();
- PortraitManager* pm=PortraitManager::getInstance();if(!pm || pm->texture.isNull())return false;
+ PortraitManager* pm=PortraitManager::getInstance();if(!pm || pm->texture.isNull())return;
  std::string key=Key(c);std::map<std::string,Ogre::TRect<float> >::iterator uv=nativeUV.find(key);
  if(uv==nativeUV.end()){
   // Force the normal portrait assignment to expose its actual atlas crop.
   if(opened && editing.getCharacter()==c && preview)pm->setImageWidget(editing,preview,true);
-  c=saved.getCharacter();if(!c)return false;
-  pm=PortraitManager::getInstance();if(!pm || pm->texture.isNull())return false;
-  uv=nativeUV.find(key);if(uv==nativeUV.end())return false;
+  c=saved.getCharacter();if(!c)return;
+  pm=PortraitManager::getInstance();if(!pm || pm->texture.isNull())return;
+  uv=nativeUV.find(key);if(uv==nativeUV.end())return;
  }
  Ogre::TexturePtr source=pm->texture;
  std::map<std::string,std::string>::iterator textureName=nativeTextures.find(key);
  if(textureName!=nativeTextures.end()){Ogre::TexturePtr actual=Ogre::TextureManager::getSingleton().getByName(textureName->second);if(!actual.isNull())source=actual;}
- if(!Compose(c,source,pm->texturePortraitSize,uv->second))return false;
+ Compose(c,source,pm->texturePortraitSize,uv->second);
  static std::map<std::string,bool> reported;if(!reported[key]){reported[key]=true;std::ostringstream line;line<<"Portrait Editor: source="<<source->getName()<<" size="<<source->getWidth()<<"x"<<source->getHeight()<<" captured native portrait crop for "<<c->getName()<<" = "<<uv->second.left<<","<<uv->second.top<<","<<uv->second.right<<","<<uv->second.bottom;DebugLog(line.str());}
- return true;
 }
 void (*originalRender)(RenderToTextureotron*,Character*,Ogre::SharedPtr<Ogre::Texture>,const iVector2&,const Ogre::TRect<float>&)=0;
 void Render(RenderToTextureotron* machine,Character* c,Ogre::SharedPtr<Ogre::Texture> texture,const iVector2& size,const Ogre::TRect<float>& rect){
  if(!machine)return;
  if(!pluginReady || failed || !c || !c->isPlayerCharacter()){originalRender(machine,c,texture,size,rect);return;}
  hand saved=c->getHandle();
- RenderContext ctx;ctx.machine=machine;ctx.character=c;ctx.settings=Sanitize(Effective(c),BackgroundCount());RenderContext* previous=active;active=&ctx;
+ RenderContext ctx;ctx.character=c;ctx.settings=Sanitize(Effective(c),BackgroundCount());RenderContext* previous=active;active=&ctx;
  try{originalRender(machine,c,texture,size,rect);}catch(...){active=previous;Restore(ctx);throw;}
  active=previous;
  Restore(ctx);
  c=saved.getCharacter();if(!c)return;
- QueueComposition(c,false);
+ if(Effective(c).background!=0)pendingComposition[Key(c)]=c->getHandle();
  static bool warned=false;if(!ctx.adjusted && !warned){warned=true;DebugLog("Portrait Editor: no camera matrix callback during portrait rendering");}
  static bool reached=false;if(ctx.adjusted && !reached){reached=true;DebugLog("Portrait Editor: live portrait camera controls active");}
 }
